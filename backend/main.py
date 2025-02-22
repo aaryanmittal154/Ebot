@@ -44,11 +44,11 @@ async def get_emails(skip: int = 0, limit: int = 100, db: Session = Depends(get_
 
 
 @app.post("/process-emails/")
-async def process_new_emails(db: Session = Depends(get_db)):
-    """Process new emails from the IMAP server"""
+async def process_emails(db: Session = Depends(get_db)):
+    """Process all emails from the IMAP server"""
     try:
-        processed_emails = await email_processor.process_new_emails(db)
-        return {"message": f"Processed {len(processed_emails)} new emails"}
+        processed_emails = await email_processor.process_all_emails(db)
+        return {"message": f"Processed {len(processed_emails)} emails"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

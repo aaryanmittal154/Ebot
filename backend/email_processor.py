@@ -21,7 +21,7 @@ class EmailProcessor:
         self.vector_store = VectorStore(settings)
 
     async def connect_to_imap(self) -> IMAPClient:
-        """Establish IMAP connection"""
+        """Establish IMAP connection with proper error handling"""
         try:
             server = IMAPClient(
                 self.settings.imap_server,
@@ -29,7 +29,17 @@ class EmailProcessor:
                 use_uid=True,
                 ssl=True,
             )
-            server.login(self.settings.email_address, self.settings.email_password)
+
+            # Attempt to login with proper error handling
+            try:
+                server.login(self.settings.email_address, self.settings.email_password)
+            except Exception as e:
+                logging.error(f"Failed to login to IMAP server: {str(e)}")
+                raise HTTPException(
+                    status_code=401,
+                    detail="Failed to authenticate with email server. Please check your credentials.",
+                )
+
             return server
         except Exception as e:
             logging.error(f"Failed to connect to IMAP server: {str(e)}")
@@ -118,14 +128,23 @@ class EmailProcessor:
                 status_code=500, detail=f"Error parsing email: {str(e)}"
             )
 
-    async def process_new_emails(self, db: Session) -> List[Email]:
-        """Process new emails from IMAP server"""
+    async def process_all_emails(self, db: Session) -> List[Email]:
+        """Process all emails from IMAP server"""
         try:
             server = await self.connect_to_imap()
-            server.select_folder("INBOX")
 
-            # Search for unprocessed emails
-            messages = server.search(["NOT", "FLAGGED"])
+            # Select INBOX folder
+            try:
+                server.select_folder("INBOX")
+            except Exception as e:
+                logging.error(f"Failed to select INBOX: {str(e)}")
+                raise HTTPException(
+                    status_code=500, detail="Failed to access INBOX folder"
+                )
+
+            # Search for ALL emails
+            messages = server.search(["ALL"])
+
             if not messages:
                 return []
 
@@ -136,7 +155,7 @@ class EmailProcessor:
                     email_message = email.message_from_bytes(message_data[b"RFC822"])
                     parsed_email = self.parse_email_message(email_message)
 
-                    # Create embedding
+                    # Create embedding for the email content
                     embedding_id = await self.vector_store.add_text(
                         parsed_email["content"],
                         metadata={
@@ -145,7 +164,7 @@ class EmailProcessor:
                         },
                     )
 
-                    # Create or update thread
+                    # Handle thread creation/update
                     thread = (
                         db.query(EmailThread)
                         .filter(EmailThread.thread_id == parsed_email["thread_id"])
@@ -157,32 +176,39 @@ class EmailProcessor:
                             thread_id=parsed_email["thread_id"],
                             subject=parsed_email["subject"],
                             last_updated=parsed_email["received_date"],
+                            participant_count=1,
+                            email_count=1,
                         )
                         db.add(thread)
-                        db.flush()  # Ensure thread is created before email
+                        db.flush()
                     else:
                         thread.last_updated = parsed_email["received_date"]
                         thread.email_count += 1
 
-                    # Create email record
-                    email_record = Email(
-                        message_id=str(uid),
-                        subject=parsed_email["subject"],
-                        sender=parsed_email["sender"],
-                        recipient=self.settings.email_address,
-                        content=parsed_email["content"],
-                        html_content=parsed_email["html_content"],
-                        received_date=parsed_email["received_date"],
-                        thread_id=parsed_email["thread_id"],
-                        embedding_id=embedding_id,
-                        is_processed=True,
+                    # Create or update email record
+                    email_record = (
+                        db.query(Email).filter(Email.message_id == str(uid)).first()
                     )
 
-                    db.add(email_record)
-                    processed_emails.append(email_record)
+                    if not email_record:
+                        email_record = Email(
+                            message_id=str(uid),
+                            subject=parsed_email["subject"],
+                            sender=parsed_email["sender"],
+                            recipient=self.settings.email_address,
+                            content=parsed_email["content"],
+                            html_content=parsed_email["html_content"],
+                            received_date=parsed_email["received_date"],
+                            thread_id=parsed_email["thread_id"],
+                            embedding_id=embedding_id,
+                            is_processed=True,
+                        )
+                        db.add(email_record)
+                    else:
+                        email_record.embedding_id = embedding_id
+                        email_record.is_processed = True
 
-                    # Mark as processed in IMAP
-                    server.add_flags(uid, ["\\Flagged"])
+                    processed_emails.append(email_record)
 
                 except Exception as e:
                     logging.error(f"Error processing email {uid}: {str(e)}")
@@ -191,11 +217,16 @@ class EmailProcessor:
             db.commit()
             server.logout()
 
+            if processed_emails:
+                logging.info(f"Successfully processed {len(processed_emails)} emails")
+            else:
+                logging.info("No emails to process")
+
             return processed_emails
 
         except Exception as e:
             db.rollback()
-            logging.error(f"Error in process_new_emails: {str(e)}")
+            logging.error(f"Error in process_all_emails: {str(e)}")
             raise HTTPException(
                 status_code=500, detail=f"Error processing emails: {str(e)}"
             )

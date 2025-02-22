@@ -17,6 +17,7 @@ from config import Settings
 from openai import AsyncOpenAI
 import re
 from datetime import datetime, timedelta
+import json
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
 
@@ -157,51 +158,57 @@ async def refresh_jobs_and_candidates(db: Session = Depends(get_db)):
 
         for email in emails:
             try:
-                # Check for job postings
-                if any(
-                    keyword in email.subject.lower()
-                    for keyword in [
-                        "job",
-                        "position",
-                        "opening",
-                        "hiring",
-                        "opportunity",
-                        "role",
-                        "career",
-                    ]
-                ):
-                    # Extract job details using regex or other parsing logic
-                    job_match = re.search(r"Position:\s*(.*?)(?:\n|$)", email.content)
-                    company_match = re.search(
-                        r"Company:\s*(.*?)(?:\n|$)", email.content
-                    )
-                    location_match = re.search(
-                        r"Location:\s*(.*?)(?:\n|$)", email.content
-                    )
-                    requirements_match = re.search(
-                        r"Requirements:\s*(.*?)(?:\n|$)", email.content
-                    )
+                # First, use OpenAI to classify the email and extract structured information
+                prompt = f"""Analyze this email and determine if it's a job posting or a candidate profile.
+                Then extract relevant information in JSON format.
 
-                    # If no structured format found, use subject and content
-                    title = (
-                        job_match.group(1).strip()
-                        if job_match
-                        else email.subject.replace("job", "")
-                        .replace("position", "")
-                        .strip()
-                    )
+                Email Subject: {email.subject}
+                Email Content: {email.content}
 
+                Respond in this JSON format:
+                {{
+                    "type": "job_posting" or "candidate_profile" or "other",
+                    "confidence": 0.0 to 1.0,
+                    "extracted_info": {{
+                        // For job_posting:
+                        "title": "extracted job title",
+                        "company": "company name",
+                        "location": "job location",
+                        "requirements": "list of requirements",
+                        "salary_range": "salary range if mentioned",
+
+                        // For candidate_profile:
+                        "name": "candidate name",
+                        "skills": "extracted skills",
+                        "experience": "extracted experience",
+                        "preferred_location": "preferred location if mentioned"
+                    }}
+                }}"""
+
+                response = await openai_client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": "You are an expert at analyzing emails and extracting job-related information.",
+                        },
+                        {"role": "user", "content": prompt},
+                    ],
+                    temperature=0.3,
+                    response_format={"type": "json_object"},
+                )
+
+                analysis = response.choices[0].message.content
+                result = json.loads(analysis)
+
+                if result["type"] == "job_posting" and result["confidence"] > 0.7:
                     # Check if job already exists
                     existing_job = (
                         db.query(JobPosting)
                         .filter(
-                            JobPosting.title == title,
-                            JobPosting.company
-                            == (
-                                company_match.group(1).strip()
-                                if company_match
-                                else "Unknown"
-                            ),
+                            JobPosting.title == result["extracted_info"]["title"],
+                            JobPosting.company == result["extracted_info"]["company"],
+                            JobPosting.source_email_id == email.id,
                         )
                         .first()
                     )
@@ -209,23 +216,12 @@ async def refresh_jobs_and_candidates(db: Session = Depends(get_db)):
                     if not existing_job:
                         # Create job posting
                         job = JobPosting(
-                            title=title,
-                            company=(
-                                company_match.group(1).strip()
-                                if company_match
-                                else "Unknown"
-                            ),
+                            title=result["extracted_info"]["title"],
+                            company=result["extracted_info"]["company"],
                             description=email.content,
-                            requirements=(
-                                requirements_match.group(1).strip()
-                                if requirements_match
-                                else email.content
-                            ),
-                            location=(
-                                location_match.group(1).strip()
-                                if location_match
-                                else "Remote"
-                            ),
+                            requirements=result["extracted_info"]["requirements"],
+                            location=result["extracted_info"]["location"],
+                            salary_range=result["extracted_info"].get("salary_range"),
                             status="active",
                             source_email_id=email.id,
                         )
@@ -244,34 +240,9 @@ async def refresh_jobs_and_candidates(db: Session = Depends(get_db)):
                         job.embedding_id = embedding_id
                         jobs_created += 1
 
-                # Check for candidate profiles
-                if any(
-                    keyword in email.subject.lower()
-                    for keyword in [
-                        "resume",
-                        "cv",
-                        "application",
-                        "candidate",
-                        "profile",
-                    ]
+                elif (
+                    result["type"] == "candidate_profile" and result["confidence"] > 0.7
                 ):
-                    # Extract candidate details
-                    name_match = re.search(r"Name:\s*(.*?)(?:\n|$)", email.content)
-                    skills_match = re.search(r"Skills:\s*(.*?)(?:\n|$)", email.content)
-                    experience_match = re.search(
-                        r"Experience:\s*(.*?)(?:\n|$)", email.content
-                    )
-                    location_match = re.search(
-                        r"Preferred Location:\s*(.*?)(?:\n|$)", email.content
-                    )
-
-                    # If no structured format found, try to extract information
-                    name = (
-                        name_match.group(1).strip()
-                        if name_match
-                        else email.sender.split("@")[0].replace(".", " ").title()
-                    )
-
                     # Check if candidate already exists
                     existing_candidate = (
                         db.query(Candidate)
@@ -282,23 +253,13 @@ async def refresh_jobs_and_candidates(db: Session = Depends(get_db)):
                     if not existing_candidate:
                         # Create candidate profile
                         candidate = Candidate(
-                            name=name,
+                            name=result["extracted_info"]["name"],
                             email=email.sender,
                             resume_text=email.content,
-                            skills=(
-                                skills_match.group(1).strip()
-                                if skills_match
-                                else "Skills to be determined from content"
-                            ),
-                            experience=(
-                                experience_match.group(1).strip()
-                                if experience_match
-                                else "Experience to be determined from content"
-                            ),
-                            preferred_location=(
-                                location_match.group(1).strip()
-                                if location_match
-                                else None
+                            skills=result["extracted_info"]["skills"],
+                            experience=result["extracted_info"]["experience"],
+                            preferred_location=result["extracted_info"].get(
+                                "preferred_location"
                             ),
                         )
                         db.add(candidate)

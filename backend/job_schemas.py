@@ -31,7 +31,7 @@ class CandidateBase(BaseModel):
     email: EmailStr
     resume_text: str
     skills: str
-    experience: str
+    experience: str = "Not specified"
     preferred_location: Optional[str] = None
 
 

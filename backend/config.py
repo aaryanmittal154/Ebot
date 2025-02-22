@@ -1,7 +1,20 @@
 from pydantic_settings import BaseSettings
 from typing import Optional
-from dotenv import load_dotenv
+from dotenv import load_dotenv, find_dotenv
 import os
+
+def clear_env_cache():
+    """Clear all environment variable caches and reload settings."""
+    # Clear Python's environment variable cache
+    os.environ.clear()
+
+    # Clear dotenv cache by reloading
+    dotenv_path = find_dotenv()
+    if dotenv_path:
+        load_dotenv(dotenv_path, override=True)
+
+    # Create new settings instance to reload all values
+    return Settings()
 
 # Load environment variables from .env file
 load_dotenv()

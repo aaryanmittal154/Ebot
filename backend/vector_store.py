@@ -23,12 +23,25 @@ class VectorStore:
         # Get or create collection with correct dimensionality
         try:
             self.collection = self.client.get_collection("email_embeddings")
-        except:
-            # Create new collection if it doesn't exist
-            self.collection = self.client.create_collection(
-                name="email_embeddings",
-                metadata={"hnsw:space": "cosine"},  # Use cosine similarity
-            )
+        except Exception as e:
+            print(f"Error getting collection: {str(e)}")
+            print("Attempting to recreate collection...")
+            try:
+                # Delete collection if it exists but is corrupted
+                try:
+                    self.client.delete_collection("email_embeddings")
+                except:
+                    pass
+
+                # Create new collection
+                self.collection = self.client.create_collection(
+                    name="email_embeddings",
+                    metadata={"hnsw:space": "cosine"},  # Use cosine similarity
+                )
+                print("Successfully recreated collection")
+            except Exception as create_error:
+                print(f"Error creating collection: {str(create_error)}")
+                raise
 
     def _preprocess_text(self, text: str) -> str:
         """Preprocess text for better embedding quality"""
@@ -177,10 +190,16 @@ Important: Your response must be valid JSON."""
         processed_query = self._preprocess_text(query_text)
         query_embedding = await self._get_embedding(processed_query)
 
-        # Search in ChromaDB
+        # Set up where filter to exclude current thread
+        where_filter = None
+        if current_thread_id:
+            where_filter = {"thread_id": {"$ne": current_thread_id}}
+
+        # Search in ChromaDB with thread filter
         results = self.collection.query(
             query_embeddings=[query_embedding],
             n_results=n_results + 1,
+            where=where_filter,
             include=["documents", "metadatas", "distances"],
         )
 
@@ -192,9 +211,6 @@ Important: Your response must be valid JSON."""
                     results["distances"][0],
                 )
             ):
-                if current_thread_id and metadata["thread_id"] == current_thread_id:
-                    continue
-
                 similarity_score = 1 - distance
 
                 email = (
